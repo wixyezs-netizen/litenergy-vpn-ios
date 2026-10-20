@@ -1,0 +1,220 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CORE_REF: v1.14.3
+  GO_VERSION: 1.26.8
+
+jobs:
+  ipa:
+    name: IPA
+    runs-on: macos-latest
+    timeout-minutes: 75
+    env:
+      HAS_SIGNING: ${{ secrets.IOS_P12_B64 != '' && secrets.IOS_PROFILE_APP_B64 != '' && secrets.IOS_PROFILE_TUNNEL_B64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Restore sing-box core (Libbox)
+        id: libbox
+        uses: actions/cache/restore@v4
+        with:
+          path: Libbox.xcframework
+          key: libbox-ios-arm64-${{ env.CORE_REF }}-go${{ env.GO_VERSION }}-v1
+
+      - name: Build sing-box core for iOS
+        if: steps.libbox.outputs.cache-hit != 'true'
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          git clone --depth 1 --branch "$CORE_REF" https://github.com/SagerNet/sing-box.git core
+          cd core
+          bash .github/patch_go_for_ios.sh || echo "go patch skipped"
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target apple -platform ios/arm64
+          mv Libbox.xcframework ..
+          ls -la ../Libbox.xcframework
+
+      - name: Save sing-box core (Libbox)
+        if: steps.libbox.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: Libbox.xcframework
+          key: ${{ steps.libbox.outputs.cache-primary-key }}
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen ldid
+          xcodegen generate
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="1.0.0"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Build app (no signing)
+        run: |
+          set +e
+          xcodebuild -project LitEnergy.xcodeproj -scheme LitEnergy -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > build.log 2>&1
+          code=$?
+          grep -E "error:|\*\* BUILD" build.log | head -80
+          exit $code
+
+      - name: Package unsigned IPA
+        run: |
+          APP=build/Build/Products/Release-iphoneos/LitEnergy.app
+          # вшиваем entitlements (Network Extension), чтобы их подхватил инструмент переподписи
+          ldid -SPacketTunnel/PacketTunnel.entitlements "$APP/PlugIns/PacketTunnel.appex/PacketTunnel"
+          ldid -SApp/LitEnergy.entitlements "$APP/LitEnergy"
+          mkdir -p dist/Payload
+          cp -R "$APP" dist/Payload/
+          cd dist
+          zip -qry "LitEnergy-VPN-$VERSION-unsigned.ipa" Payload
+          rm -rf Payload
+          cp ../App/LitEnergy.entitlements LitEnergy.entitlements
+          cp ../PacketTunnel/PacketTunnel.entitlements PacketTunnel.entitlements
+          du -sh "../$APP" "../$APP/PlugIns/PacketTunnel.appex"
+
+      - name: Sign IPA (if certificate is configured)
+        if: env.HAS_SIGNING == 'true'
+        env:
+          P12_B64: ${{ secrets.IOS_P12_B64 }}
+          P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          PROFILE_APP_B64: ${{ secrets.IOS_PROFILE_APP_B64 }}
+          PROFILE_TUNNEL_B64: ${{ secrets.IOS_PROFILE_TUNNEL_B64 }}
+        run: |
+          set -e
+          KC="$RUNNER_TEMP/sign.keychain-db"; KP="$(uuidgen)"
+          security create-keychain -p "$KP" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KP" "$KC"
+          echo "$P12_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KP" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | awk 'NR==1{print $2}')
+          echo "$PROFILE_APP_B64" | base64 --decode > "$RUNNER_TEMP/app.mobileprovision"
+          echo "$PROFILE_TUNNEL_B64" | base64 --decode > "$RUNNER_TEMP/tunnel.mobileprovision"
+          ents() { security cms -D -i "$1" > "$RUNNER_TEMP/p.plist"; /usr/libexec/PlistBuddy -x -c "Print :Entitlements" "$RUNNER_TEMP/p.plist" > "$2"; }
+          ents "$RUNNER_TEMP/app.mobileprovision" "$RUNNER_TEMP/app.ent"
+          ents "$RUNNER_TEMP/tunnel.mobileprovision" "$RUNNER_TEMP/tunnel.ent"
+          grep -q packet-tunnel-provider "$RUNNER_TEMP/app.ent" || { echo "::error::Профиль приложения без Network Extensions (packet-tunnel-provider)"; exit 1; }
+          grep -q packet-tunnel-provider "$RUNNER_TEMP/tunnel.ent" || { echo "::error::Профиль расширения без Network Extensions (packet-tunnel-provider)"; exit 1; }
+          APP=build/Build/Products/Release-iphoneos/LitEnergy.app
+          rm -rf signed && mkdir -p signed/Payload && cp -R "$APP" signed/Payload/
+          S=signed/Payload/LitEnergy.app
+          cp "$RUNNER_TEMP/tunnel.mobileprovision" "$S/PlugIns/PacketTunnel.appex/embedded.mobileprovision"
+          cp "$RUNNER_TEMP/app.mobileprovision" "$S/embedded.mobileprovision"
+          codesign -f -s "$IDENTITY" --keychain "$KC" --entitlements "$RUNNER_TEMP/tunnel.ent" "$S/PlugIns/PacketTunnel.appex"
+          codesign -f -s "$IDENTITY" --keychain "$KC" --entitlements "$RUNNER_TEMP/app.ent" "$S"
+          codesign -dv "$S" 2>&1 | head -5
+          (cd signed && zip -qry "../dist/LitEnergy-VPN-$VERSION.ipa" Payload)
+          security delete-keychain "$KC"; rm -f "$RUNNER_TEMP"/*.p12 "$RUNNER_TEMP"/*.mobileprovision
+
+      - name: Checksums
+        run: |
+          cd dist && shasum -a 256 *.ipa > SHA256SUMS.txt && ls -la
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LitEnergy-VPN-ipa
+          path: dist
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "LitEnergy VPN iOS $VERSION" \
+            --notes "IPA для iOS 15+. Неподписанный файл подпишите сертификатом с возможностью Network Extensions (Packet Tunnel). Основано на sing-box ${CORE_REF} (GPL-3.0)." || \
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+
+  screens:
+    name: Simulator screenshots
+    runs-on: macos-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build UI for simulator (without tunnel extension)
+        run: |
+          brew install xcodegen
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("project.yml"); t = p.read_text()
+          t = t.replace("      - target: PacketTunnel\n        embed: true\n", "")
+          i = t.index("  PacketTunnel:\n"); p.write_text(t[:i])
+          PY
+          xcodegen generate
+          xcodebuild -project LitEnergy.xcodeproj -scheme LitEnergy -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO build > sim.log 2>&1 || { grep -E "error:" sim.log | head -40; exit 1; }
+
+      - name: Screenshots
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)['devices']
+          c=[x for k,v in d.items() if 'iOS' in k for x in v if x['name'].startswith('iPhone') and 'Pro Max' not in x['name'] and 'Plus' not in x['name']]
+          c.sort(key=lambda x: x['name']); print(c[-1]['udid']); print(c[-1]['name'], file=sys.stderr)")
+          xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl ui "$UDID" appearance dark || true
+          xcrun simctl status_bar "$UDID" override --time "9:41" --batteryState charged --batteryLevel 100 || true
+          APP=build/Build/Products/Debug-iphonesimulator/LitEnergy.app
+          B=com.litenergy.vpn
+          xcrun simctl install "$UDID" "$APP"
+          mkdir -p shots
+          shot() { xcrun simctl terminate "$UDID" $B >/dev/null 2>&1 || true; xcrun simctl launch "$UDID" $B "${@:2}"; sleep 8; xcrun simctl io "$UDID" screenshot "shots/$1.png"; }
+          shot 1-onboarding
+          shot 2-home -demo YES
+          shot 3-servers -demo YES -demo_sheet servers
+          shot 4-plans -demo YES -demo_sheet plans
+          shot 5-settings -demo YES -demo_sheet settings
+          shot 6-menu -demo YES -demo_sheet menu
+          shot 7-expired -demo YES -demo_expired YES
+          ls -la shots
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-screens
+          path: |
+            shots
+            sim.log
+          retention-days: 7
