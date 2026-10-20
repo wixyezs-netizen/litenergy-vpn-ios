@@ -73,7 +73,11 @@ struct Subscription: Codable, Identifiable, Equatable {
 enum ByteFormat {
     static func text(_ bytes: Int64) -> String {
         let b = Double(bytes)
-        if b >= 1_073_741_824 { return String(format: "%.1f ГБ", b / 1_073_741_824).replacingOccurrences(of: ".", with: ",") }
+        if b >= 1_073_741_824 {
+            let gb = b / 1_073_741_824
+            let s = gb >= 100 || gb.rounded() == gb ? String(format: "%.0f", gb.rounded()) : String(format: "%.1f", gb)
+            return s.replacingOccurrences(of: ".", with: ",") + " ГБ"
+        }
         if b >= 1_048_576 { return String(format: "%.0f МБ", b / 1_048_576) }
         return String(format: "%.0f КБ", max(0, b / 1024))
     }

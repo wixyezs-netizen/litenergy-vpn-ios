@@ -146,7 +146,9 @@ struct PlansSheet: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(tariff.title).font(ui(16, .semibold)).foregroundColor(.white)
-                                Text("\(tariff.days) дн.").font(ui(13)).foregroundColor(.w1Muted)
+                                if !tariff.title.contains("\(tariff.days)") {
+                                    Text("\(tariff.days) дн.").font(ui(13)).foregroundColor(.w1Muted)
+                                }
                             }
                             Spacer()
                             Text(tariff.priceText).font(ui(17, .bold)).foregroundColor(.white)
